@@ -75,6 +75,12 @@ type ConnectOptions = {
   memberProfile?: RealtimeMemberProfile;
 };
 
+type EnterTicketLease = {
+  code: number;
+  ticket: string;
+  release: () => Promise<void>;
+};
+
 type EventHandler = (...args: unknown[]) => void;
 
 type ChatRoomLike = {
@@ -500,7 +506,7 @@ export class NeteaseRealtimeTransport {
   private async requestEnterTicket(
     credentials: RealtimeCredentials,
     roomNumber: number,
-  ): Promise<[number, string]> {
+  ): Promise<EnterTicketLease> {
     const dataDir = join(
       tmpdir(),
       `cove-nim-bootstrap-${process.pid}-${randomUUID()}`,
@@ -528,6 +534,28 @@ export class NeteaseRealtimeTransport {
     child.stderr?.on("data", (chunk: Buffer | string) => {
       stderr = (stderr + String(chunk)).slice(-2000);
     });
+
+    let released = false;
+    const release = async () => {
+      if (released) return;
+      released = true;
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+      }
+      await new Promise<void>((resolve) => {
+        if (child.exitCode !== null || child.signalCode !== null) {
+          resolve();
+          return;
+        }
+        const timer = setTimeout(resolve, 1000);
+        timer.unref?.();
+        child.once("exit", () => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+      await rm(dataDir, { recursive: true, force: true }).catch(() => {});
+    };
 
     try {
       const result = await new Promise<[number, string]>((resolve, reject) => {
@@ -593,24 +621,10 @@ export class NeteaseRealtimeTransport {
       });
 
       console.log("NetEase NIM enter ticket acquired in isolated bootstrap child");
-      return result;
-    } finally {
-      if (child.exitCode === null && child.signalCode === null) {
-        child.kill("SIGKILL");
-      }
-      await new Promise<void>((resolve) => {
-        if (child.exitCode !== null || child.signalCode !== null) {
-          resolve();
-          return;
-        }
-        const timer = setTimeout(resolve, 1000);
-        timer.unref?.();
-        child.once("exit", () => {
-          clearTimeout(timer);
-          resolve();
-        });
-      });
-      await rm(dataDir, { recursive: true, force: true }).catch(() => {});
+      return { code: result[0], ticket: result[1], release };
+    } catch (error) {
+      await release();
+      throw error;
     }
   }
 
@@ -755,9 +769,11 @@ export class NeteaseRealtimeTransport {
     }
     this.roomNumber = roomNumber;
 
-    const [requestCode, requestLoginData] =
-      await this.requestEnterTicket(options.credentials, roomNumber);
+    const ticketLease = await this.requestEnterTicket(options.credentials, roomNumber);
+    const requestCode = ticketLease.code;
+    const requestLoginData = ticketLease.ticket;
     if (requestCode !== 200 || !requestLoginData) {
+      await ticketLease.release();
       throw new Error(`NIM chatroom enter ticket failed code=${requestCode}`);
     }
 
@@ -772,6 +788,7 @@ export class NeteaseRealtimeTransport {
     );
     if (!started) {
       this.pendingEnter = null;
+      await ticketLease.release();
       throw new Error("NIM chatroom enter request was rejected locally");
     }
 
@@ -822,6 +839,7 @@ export class NeteaseRealtimeTransport {
       this.status.connected = true;
       this.status.lastError = null;
     } finally {
+      await ticketLease.release();
       if (timeoutHandle) clearTimeout(timeoutHandle);
       if (this.pendingEnter?.generation === generation) this.pendingEnter = null;
     }
