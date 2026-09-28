@@ -1,4 +1,5 @@
 import { mkdir } from "node:fs/promises";
+import { requestChatRoomEnterWithRetry } from "./nimTicketRetry.js";
 
 type BootstrapRequest = {
   appKey: string;
@@ -67,7 +68,7 @@ async function run(request: BootstrapRequest): Promise<[number, string]> {
     throw new Error("NIM login failed" + (loginCode === null ? "" : " code=" + loginCode));
   }
 
-  return await plugin.chatRoomRequestEnterAsync(request.roomNumber, null, "");
+  return await requestChatRoomEnterWithRetry(plugin, request.roomNumber);
 }
 
 let started = false;
