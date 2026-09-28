@@ -70,10 +70,13 @@ Bridge Core
   └─ SSE Wake Hub
 
 Host Adapter
-  └─ MCP App Listener Widget
-      ├─ tools/call
-      ├─ ui/update-model-context
-      └─ ui/message
+  ├─ MCP App Widget Listener
+  │   ├─ tools/call
+  │   ├─ ui/update-model-context
+  │   └─ ui/message
+  └─ Long-wait MCP
+      ├─ cove_bridge_wait
+      └─ cove_bridge_wait_ack
 
 Reply Egress
   └─ NIM ChatRoom send
@@ -509,7 +512,22 @@ statePendingByKey
 
 ---
 
-# 5. Listener：先从最小纯轮询开始
+# 5. Listener：V2 有两种正式路线
+
+正式部署时，从下面两种 Host dispatch 方式中 **二选一，不要同时运行**：
+
+| 路线 | 工作方式 | 网页端 | 桌面端 | 手机端（iOS） |
+| --- | --- | --- | --- | --- |
+| Widget Listener | 外部事件到达后，通过 `ui/message` 主动投进对话 | 会出现人工确认 | 当前实测不可用 | 可用 |
+| Long-wait MCP | 已经开始的模型 turn 通过 MCP tool 等待未来事件 | 可用 | 可用 | 可用 |
+
+上表是截至 **2026-09-28** 的项目实测。
+
+如果需要跨网页 / 桌面 / 手机保持统一行为，当前优先推荐 Long-wait；如果主要在手机端使用，并希望保留“外部事件主动敲门”的体验，可以选择 Widget Listener。
+
+两者共用同一个 Bridge Queue，同时开启会形成 competing consumers。
+
+## 5.1 Widget / Host-injection：最小纯轮询基线
 
 核心文件：
 
@@ -518,7 +536,7 @@ src/listener-html.ts
 src/listenerWake.ts
 ```
 
-Listener 是 Host Adapter。
+Widget Listener 是 Host Adapter 的一种实现。
 
 它不是业务逻辑中心，也**不要求必须支持 SSE**。
 
@@ -534,11 +552,60 @@ Listener 是 Host Adapter。
 
 也就是说，**纯轮询就是可移植基线**。SSE / WebSocket / Push 都只是后面的延迟优化。
 
-更完整、可以直接交给编码 Agent 的最小协议见：
+Widget / Host-injection 路线的最小正确性协议就是：
 
-**[MINIMAL_LISTENER_PROTOCOL.md](MINIMAL_LISTENER_PROTOCOL.md)**
+```text
+sync / reserve
+→ hidden context
+→ visible message
+→ delivered / dismissed / release
+```
 
-## 5.1 Level 0：手动 sync
+Host 本地至少要记住两类 eventId：
+
+```text
+recentlyDispatched
+pendingAcks
+```
+
+已经显示过的事件如果 ACK 失败，只能重试 ACK，绝不能重新显示。
+
+参考伪代码：
+
+```ts
+async function tick() {
+  await flushPendingAcks()
+
+  const result = await bridge.call("cove_bridge_sync", {})
+  const event = result.meta?.event
+  if (!event) return
+
+  if (recentlyDispatched.has(event.id)) {
+    pendingAcks.add(event.id)
+    return flushPendingAcks()
+  }
+
+  try {
+    await host.updateModelContext(event.modelContext)
+    const handoff = await host.injectUserMessage(event.visibleText)
+
+    if (handoff.outcome === "dismissed") {
+      await bridge.call("cove_bridge_dismissed", { eventId: event.id })
+      return
+    }
+  } catch (error) {
+    // 只有在 Host 尚未接管消息时才允许 release。
+    await bridge.call("cove_bridge_release", { eventId: event.id })
+    throw error
+  }
+
+  recentlyDispatched.add(event.id)
+  pendingAcks.add(event.id)
+  await flushPendingAcks()
+}
+```
+
+## 5.2 Level 0：手动 sync
 
 能力最弱的 Host 甚至不需要 timer：
 
@@ -549,7 +616,7 @@ Listener 是 Host Adapter。
 
 只要这一层能跑通，就已经能验证 Queue、reservation、Host dispatch、ACK 和 routed reply。
 
-## 5.2 Level 1：纯轮询 Listener
+## 5.3 Level 1：纯轮询 Listener
 
 最基础实现：
 
@@ -565,7 +632,7 @@ setInterval(() => {
 
 轮询间隔可以按客户端限制调整。它只影响延迟，不改变 Queue / reply / dedupe 的正确性。
 
-## 5.3 Level 2：Wake + Pull
+## 5.4 Level 2：Wake + Pull
 
 纯轮询跑通后，再加：
 
@@ -593,6 +660,53 @@ Wake = 低延迟加速
 一句话：
 
 > push for latency, pull for correctness.
+
+---
+
+## 5.5 Long-wait MCP：另一条正式 dispatch 路径
+
+核心文件：
+
+```text
+src/bridge/registerWaitTool.ts
+```
+
+Long-wait 不调用 `ui/message`。它让一个已经开始的模型 turn 等待 Bridge Queue 的未来事件：
+
+```text
+用户明确开始监听
+→ cove_bridge_wait
+→ reserve event
+→ tool result 返回
+→ cove_bridge_wait_ack
+→ 处理事件
+→ required reply（如有）
+→ next wait
+```
+
+它仍然保留 Queue ordering、eventId、ACK、reply route、reply dedupe 和 backpressure。
+
+它解决的是 Host dispatch 限制，不是后台常驻问题。没有运行中的模型 turn 时，Long-wait 不会凭空启动新 turn。
+
+单次 wait 当前最多 **45 秒**。timeout 是正常边界，不代表监听意图失败；用户仍明确要求继续监听时，可以继续下一轮。
+
+事件到达后的完整事务：
+
+```text
+pending
+→ reserve
+→ cove_bridge_wait 返回 event
+→ cove_bridge_wait_ack(eventId)
+→ 处理 modelContext / visibleText
+→ required cove_bridge_reply（如有）
+→ next wait
+```
+
+模型侧 ACK 使用 `cove_bridge_wait_ack`。Widget Listener 仍使用 app-only delivered 路径，二者不要混用 ACK 责任。
+
+如果上一条 required event 还没有完成 routed reply，下一次 wait 会立即返回 `awaitingReply=true`，不能绕过 backpressure 去取下一条。
+
+取消中的 wait、timeout、Host 更高层总时长限制都不改变一个原则：Long-wait 只是替换 Host dispatch，不绕开 Queue、reservation、ACK、reply route、去重或 backpressure。
 
 ---
 
@@ -738,22 +852,21 @@ reserve event
 ↓
 ui/update-model-context
 ↓
-ui/message
-↓
-rememberDispatched(eventId)
-↓
-cove_bridge_delivered
+ui/message handoff
+├─ accepted  → rememberDispatched → cove_bridge_delivered
+├─ dismissed → cove_bridge_dismissed
+└─ pre-handoff failure → cove_bridge_release
 ```
 
-## dispatch 前失败
+不同 Host 对 `ui/message` 的交互可以不同，这个差异属于 Host adapter，不应该改写 Queue / reply 协议。
 
-例如：
+截至 2026-09-28，当前 ChatGPT 实测是：网页端会弹出人工确认；桌面端这条 Widget 投递路线不可用；手机端（iOS）可用。如果目标 Host 不适合这条路线，优先选择 Long-wait，而不是修改 Queue Core 去迎合 Host。
 
-```text
-ui/update-model-context 失败
-```
+## handoff 前失败
 
-此时 Host 没接受完整消息：
+例如 `ui/update-model-context` 失败，或者 `ui/message` 尚未真正交给 Host 就报错。
+
+此时用户可见副作用还没发生，可以：
 
 ```text
 release(eventId)
@@ -761,21 +874,45 @@ release(eventId)
 
 允许重试。
 
-## ui/message 成功后 ACK 失败
+## Host 接受后 ACK 失败
 
-不能 release。
-
-只进入：
+不能 release，只进入：
 
 ```text
 pendingAcks
 ```
 
-后续优先 flush ACK。
+后续优先 flush ACK，绝不重新 `ui/message`。
+
+## Host / 用户明确取消
+
+如果 Host 已经接管 `ui/message`，并且最终结果是 dismissed / cancelled：
+
+```text
+cove_bridge_dismissed(eventId)
+```
+
+这是 terminal outcome。不要 release，不要让事件复活；对于 required reply，该 terminal 状态也必须释放 backpressure。
 
 ---
 
 # 10. Host 兼容层怎么改
+
+新 Host 的推荐适配顺序：
+
+```text
+1. 手动 sync / wait
+2. 确认 Queue reservation
+3. hidden context 与 visible message 分层
+4. delivered / dismissed / release 边界
+5. eventId 去重
+6. required reply backpressure
+7. routed reply
+8. 最后再加 SSE / WebSocket / native push
+```
+
+如果 Host 本身不支持可靠的主动消息注入，不要硬做 Widget 路线；直接选择 Long-wait 或实现新的 Host Adapter。
+
 
 如果你的 AI 客户端不是当前 MCP Apps Host，不要硬抄 Widget。
 
@@ -997,12 +1134,14 @@ accountTools.ts
 - 实时 link 状态
 - 发送 ChatRoom 文本
 
-长期目标：
+当前实现：
 
 ```text
 NIM = realtime primary
-HTTP = reconcile / fallback
+HTTP = room/session lifecycle + reconcile / fallback
 ```
+
+当 realtime 连接正常且状态新鲜时，不再用高频 HTTP snapshot 覆盖 realtime anchor；realtime 断开时则立即允许 HTTP reconcile 接管。
 
 ---
 
@@ -1097,7 +1236,7 @@ pending send 按 messageId 跟踪。
 
 # 20. Playback realtime 当前做到哪里
 
-这是最重要的“不要假装已经完成”。
+这一层现在已经从“只会 decode”推进到 TogetherWorker 的主播放状态链路。
 
 ## 已实现 / 已验证到的部分
 
@@ -1113,6 +1252,8 @@ event_type = 20000
 
 ```text
 serverSeq
+clientSeq
+senderId
 commandType
 songId
 formerSongId
@@ -1131,35 +1272,32 @@ progressMs=...
 serverSeq=...
 ```
 
-## 还没完成的部分
+## 当前主链路
 
-当前 playback event：
+现在 playback event 会直接进入 TogetherWorker：
 
 ```text
 decode
-→ 写入 realtime status
-→ log
+→ stale serverSeq guard
+→ playback state update
+→ song / pause / resume handling
+→ heartbeat 从最新 realtime anchor 继续推进
 ```
 
-但还没有成为 TogetherWorker 的主 playback state source。
+realtime 连接正常且最近状态足够新时，会跳过重复的 HTTP playback reconcile；一旦 realtime 断开，HTTP reconcile 会立即恢复。
 
-TogetherWorker 目前仍然主要在 poll loop 中：
+因此现在的原则已经不是“HTTP 为主、realtime 只记日志”，而是：
 
 ```text
-getRoomStatus()
-getPlaying()
-updatePlayback()
-heartbeat()
-handlePlaying()
+realtime for authority and latency
+HTTP for lifecycle, reconcile and fallback
 ```
-
-因此下一步不是“继续堆解析器”，而是重构调度职责。
 
 ---
 
-# 21. Playback 正确的下一版结构
+# 21. Playback 当前调度与控制结构
 
-目标：
+当前结构：
 
 ```text
 NIM realtime playback
@@ -1175,25 +1313,41 @@ Heartbeat
 → 独立 cadence
 ```
 
-不要简单把整个 poll interval 从 4 秒改到 30 秒。
-
-因为当前 poll 同时耦合了：
-
-- room check
-- realtime ensure
-- playback snapshot
-- heartbeat
-- song change handling
-
-应拆成三个生命周期：
+调度职责按三个概念分开处理：
 
 ```text
-Room / reconcile loop
-
-Heartbeat loop
-
+Room / reconcile
+Heartbeat
 Realtime event handler
 ```
+
+TogetherWorker 仍负责统一编排，但 realtime 事件可以直接更新状态；HTTP snapshot 只有在需要 reconcile / fallback 时才重新校准；heartbeat 则从当前 anchor 推进进度。
+
+## 播放控制的成功边界
+
+PAUSE / RESUME / GOTO 会先向网易云上报控制命令，但 **HTTP report 成功不等于播放成功**。
+
+控制请求会记录：
+
+```text
+commandType
+clientSeq
+baselineServerSeq
+expected sender
+expected songId
+```
+
+随后必须等匹配的 NIM realtime playback event。只有 sender、`clientSeq`、命令和目标歌曲符合预期，并且 `serverSeq` 比基线新，才完成 pending control。
+
+如果 realtime 当前未连接，Bridge 会拒绝执行这种无法确认的播放控制，而不是返回一个无法验证的成功。
+
+## GOTO / NEXT / ENQUEUE_NEXT
+
+`GOTO` 在上报前先读取 Together playlist。目标歌曲不在当前 `displayList` 时直接拒绝，要求先 enqueue。
+
+`NEXT` 从当前 `ORDER_LOOP displayList` 解析真正的下一首，再复用 realtime-confirmed GOTO。
+
+`ENQUEUE_NEXT` 使用 Together playlist 的队列修改接口更新 `displayList`，随后重新读取 playlist；只有目标歌曲确实紧跟当前歌曲、并且队列版本符合预期，才算成功。
 
 ---
 
@@ -1688,7 +1842,7 @@ Agent 改代码前先读：
 
 ```text
 src/server.ts
-  HTTP/MCP ingress, BridgeEvent construction, source routing
+  HTTP ingress + MCP transport composition
 
 src/types.ts
   Bridge event/reply types
@@ -1696,8 +1850,20 @@ src/types.ts
 src/queue.ts
   queue semantics + reply state
 
+src/bridge/events.ts
+  BridgeEvent construction + source / stream / reply routing
+
+src/bridge/registerApp.ts
+  stable Widget resource + open tool + listener session
+
+src/bridge/registerTools.ts
+  shared sync / delivered / dismissed / release / routed reply tools
+
+src/profiles.ts
+  backward-compatible `/mcp` + Music-scoped `/mcp/music`
+
 src/mcp.ts
-  MCP resources/tools, sync/delivered/release/reply
+  thin MCP composition layer
 
 src/listener-html.ts
   Host Widget + SSE + dispatch + client dedupe
@@ -1708,14 +1874,20 @@ src/listenerWake.ts
 src/replyBubbles.ts
   outbound bubble normalization
 
+src/netease/registerTogetherTools.ts
+  Together Music V2 MCP tool surface
+
 src/netease/togetherWorker.ts
-  NetEase orchestration
+  NetEase orchestration + realtime-primary playback + confirmed controls
 
 src/netease/realtimeTransport.ts
   node-nim native realtime
 
+src/netease/nimTicketBootstrap.ts
+  isolated NIM ticket bootstrap child
+
 src/netease/playbackState.ts
-  current playback cache
+  current playback cache + progress anchor
 
 src/netease/lyricsContext.ts
   full-song hidden context
@@ -1789,11 +1961,17 @@ src/netease/lyricsContext.ts
 - Conversation / State split
 - full lyrics hidden context
 - playback event decoder
+- NIM playback realtime 驱动 TogetherWorker 主状态，HTTP reconcile / fallback
+- realtime-confirmed PAUSE / RESUME / GOTO / NEXT
+- playlist-confirmed `ENQUEUE_NEXT`
+- GOTO 对 `displayList` 外目标的拒绝保护
 - SSE endpoint public streaming
 - short-lived single-use listener token
 - EventSource Listener implementation
+- human-confirmed `ui/message` dismissed terminal handling
 - NIM messageId duplicate suppression
 - Widget eventId duplicate suppression
+- `/mcp` 向后兼容 + `/mcp/music` Music profile
 
 ## 已实现但仍在继续做端到端稳定性验收
 
@@ -1802,7 +1980,6 @@ src/netease/lyricsContext.ts
 
 ## 还没有宣称完成
 
-- NIM playback realtime 驱动 TogetherWorker 主状态
 - SQLite persistence
 - crash-safe reply journal
 - multi-listener semantics
