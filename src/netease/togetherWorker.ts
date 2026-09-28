@@ -82,6 +82,7 @@ export class TogetherWorker {
   private joinedPending = false;
   private lastHeartbeatAt = 0;
   private lastRealtimeAttemptAt = 0;
+  private realtimeFailureStreak = 0;
   private lastPlaybackServerSeq: number | null = null;
   private lastPlaybackReconcileAt = 0;
   private latestPlaying: PlayingState | null = null;
@@ -408,7 +409,11 @@ export class TogetherWorker {
     ) return;
 
     const now = Date.now();
-    if (now - this.lastRealtimeAttemptAt < 10_000) return;
+    const retryDelayMs = Math.min(
+      60_000,
+      10_000 * 2 ** Math.max(0, this.realtimeFailureStreak - 1),
+    );
+    if (now - this.lastRealtimeAttemptAt < retryDelayMs) return;
     this.lastRealtimeAttemptAt = now;
 
     try {
@@ -431,8 +436,10 @@ export class TogetherWorker {
           ...(this.accountProfile.gender !== null ? { gender: this.accountProfile.gender } : {}),
         },
       });
+      this.realtimeFailureStreak = 0;
       console.log(`NetEase NIM realtime connected: roomId=${roomId} chatRoomId=${chatRoomId}`);
     } catch (error) {
+      this.realtimeFailureStreak += 1;
       this.realtime.recordConnectionError(error);
       const detail = error instanceof Error ? error.message : "unknown error";
       console.error(`NetEase NIM realtime connect failed: ${detail}`);
@@ -493,6 +500,7 @@ export class TogetherWorker {
     this.joinedPending = true;
     this.lastHeartbeatAt = 0;
     this.lastRealtimeAttemptAt = 0;
+    this.realtimeFailureStreak = 0;
     this.lastPlaybackServerSeq = null;
     this.lastPlaybackReconcileAt = 0;
     this.latestPlaying = null;
@@ -515,6 +523,7 @@ export class TogetherWorker {
     this.joinedPending = false;
     this.lastHeartbeatAt = 0;
     this.lastRealtimeAttemptAt = 0;
+    this.realtimeFailureStreak = 0;
     this.lastPlaybackServerSeq = null;
     this.lastPlaybackReconcileAt = 0;
     this.latestPlaying = null;
