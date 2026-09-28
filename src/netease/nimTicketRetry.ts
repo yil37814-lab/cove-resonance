@@ -11,8 +11,34 @@ type RetryOptions = {
   delay?: (ms: number) => Promise<void>;
 };
 
+type LoginStateReader = {
+  getLoginState(extension: string): number;
+};
+
+type LoginWaitOptions = {
+  maxChecks?: number;
+  intervalMs?: number;
+  delay?: (ms: number) => Promise<void>;
+};
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export async function waitForNimLogin(
+  client: LoginStateReader,
+  options: LoginWaitOptions = {},
+): Promise<void> {
+  const maxChecks = Math.max(1, options.maxChecks ?? 51);
+  const intervalMs = Math.max(0, options.intervalMs ?? 200);
+  const delay = options.delay ?? sleep;
+
+  for (let check = 1; check <= maxChecks; check += 1) {
+    if (client.getLoginState("") === 1) return;
+    if (check < maxChecks) await delay(intervalMs);
+  }
+
+  throw new Error("NIM login did not reach the connected state before timeout");
 }
 
 export async function requestChatRoomEnterWithRetry(
@@ -27,7 +53,10 @@ export async function requestChatRoomEnterWithRetry(
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     const result = await plugin.chatRoomRequestEnterAsync(roomId, null, "");
-    if (result[0] !== NIM_CONNECTION_ERROR_CODE || attempt === maxAttempts) return result;
+    if (result[0] !== NIM_CONNECTION_ERROR_CODE) return result;
+    if (attempt === maxAttempts) {
+      throw new Error(`NIM chatroom enter ticket failed code=${NIM_CONNECTION_ERROR_CODE}`);
+    }
 
     const waitMs = Math.min(maxDelayMs, baseDelayMs * 2 ** (attempt - 1));
     await delay(waitMs);
