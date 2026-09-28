@@ -1,5 +1,5 @@
 import { mkdir } from "node:fs/promises";
-import { requestChatRoomEnterWithRetry } from "./nimTicketRetry.js";
+import { requestChatRoomEnterWithRetry, waitForNimLogin } from "./nimTicketRetry.js";
 
 type BootstrapRequest = {
   appKey: string;
@@ -13,6 +13,7 @@ type NimClientLike = {
   init(appKey: string, appDataDir: string, appInstallDir: string, config: Record<string, unknown>): boolean;
   initEventHandlers(): void;
   login(appKey: string, account: string, password: string, cb: null, extension: string): Promise<[unknown]>;
+  getLoginState(extension: string): number;
 };
 
 type NimPluginLike = {
@@ -68,6 +69,7 @@ async function run(request: BootstrapRequest): Promise<[number, string]> {
     throw new Error("NIM login failed" + (loginCode === null ? "" : " code=" + loginCode));
   }
 
+  await waitForNimLogin(client);
   return await requestChatRoomEnterWithRetry(plugin, request.roomNumber);
 }
 
