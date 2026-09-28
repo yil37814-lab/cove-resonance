@@ -46,16 +46,21 @@ export async function requestChatRoomEnterWithRetry(
   roomId: number,
   options: RetryOptions = {},
 ): Promise<[number, string]> {
-  const maxAttempts = Math.max(1, options.maxAttempts ?? 6);
+  const maxAttempts = Math.max(1, options.maxAttempts ?? 9);
   const baseDelayMs = Math.max(0, options.baseDelayMs ?? 250);
   const maxDelayMs = Math.max(baseDelayMs, options.maxDelayMs ?? 2_000);
   const delay = options.delay ?? sleep;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     const result = await plugin.chatRoomRequestEnterAsync(roomId, null, "");
-    if (result[0] !== NIM_CONNECTION_ERROR_CODE) return result;
+    const [code, ticket] = result;
+    const retryable = code === NIM_CONNECTION_ERROR_CODE || (code === 200 && !ticket.trim());
+    if (!retryable) return result;
     if (attempt === maxAttempts) {
-      throw new Error(`NIM chatroom enter ticket failed code=${NIM_CONNECTION_ERROR_CODE}`);
+      throw new Error(
+        `NIM chatroom enter ticket unavailable code=${code}`
+        + (ticket.trim() ? "" : " emptyTicket=true"),
+      );
     }
 
     const waitMs = Math.min(maxDelayMs, baseDelayMs * 2 ** (attempt - 1));
