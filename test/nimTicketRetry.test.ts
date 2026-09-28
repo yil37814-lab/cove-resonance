@@ -59,6 +59,29 @@ test("retries connection error 415 in the same NIM bootstrap process", async () 
   assert.deepEqual(delays, [250, 500]);
 });
 
+test("retries a successful response whose chatroom ticket is still empty", async () => {
+  const results: Array<[number, string]> = [
+    [200, ""],
+    [200, "ticket"],
+  ];
+  const delays: number[] = [];
+  let calls = 0;
+
+  const result = await requestChatRoomEnterWithRetry({
+    async chatRoomRequestEnterAsync() {
+      const next = results[calls];
+      calls += 1;
+      return next;
+    },
+  }, 123, {
+    delay: async (ms) => { delays.push(ms); },
+  });
+
+  assert.deepEqual(result, [200, "ticket"]);
+  assert.equal(calls, 2);
+  assert.deepEqual(delays, [250]);
+});
+
 test("does not retry non-connection ticket failures", async () => {
   let calls = 0;
   const result = await requestChatRoomEnterWithRetry({
@@ -89,7 +112,7 @@ test("fails after the configured maximum number of 415 responses", async () => {
       maxDelayMs: 150,
       delay: async (ms) => { delays.push(ms); },
     }),
-    /code=415/,
+    /code=415 emptyTicket=true/,
   );
 
   assert.equal(calls, 4);
