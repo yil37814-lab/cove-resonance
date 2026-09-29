@@ -82,18 +82,40 @@ test("retries a successful response whose chatroom ticket is still empty", async
   assert.deepEqual(delays, [250]);
 });
 
-test("does not retry non-connection ticket failures", async () => {
+test("retries an empty ticket even when NIM uses another transient status code", async () => {
+  const results: Array<[number, string]> = [
+    [0, ""],
+    [408, ""],
+    [200, "ticket"],
+  ];
+  let calls = 0;
+
+  const result = await requestChatRoomEnterWithRetry({
+    async chatRoomRequestEnterAsync() {
+      const next = results[calls];
+      calls += 1;
+      return next;
+    },
+  }, 123, {
+    delay: async () => {},
+  });
+
+  assert.deepEqual(result, [200, "ticket"]);
+  assert.equal(calls, 3);
+});
+
+test("does not retry non-connection failures with a non-empty response payload", async () => {
   let calls = 0;
   const result = await requestChatRoomEnterWithRetry({
     async chatRoomRequestEnterAsync() {
       calls += 1;
-      return [403, ""];
+      return [403, "error-payload"];
     },
   }, 123, {
     delay: async () => { throw new Error("unexpected delay"); },
   });
 
-  assert.deepEqual(result, [403, ""]);
+  assert.deepEqual(result, [403, "error-payload"]);
   assert.equal(calls, 1);
 });
 
