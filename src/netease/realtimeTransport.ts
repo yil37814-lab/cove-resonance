@@ -428,6 +428,7 @@ export class NeteaseRealtimeTransport {
   private connecting: Promise<void> | null = null;
   private pendingEnter: PendingEnter | null = null;
   private activeMemberProfile: RealtimeMemberProfile | null = null;
+  private activeTicketLease: EnterTicketLease | null = null;
   private generation = 0;
   private status: RealtimeTransportStatus;
 
@@ -769,7 +770,12 @@ export class NeteaseRealtimeTransport {
     }
     this.roomNumber = roomNumber;
 
+    const previousTicketLease = this.activeTicketLease;
+    this.activeTicketLease = null;
+    await previousTicketLease?.release();
+
     const ticketLease = await this.requestEnterTicket(options.credentials, roomNumber);
+    let keepTicketLease = false;
     const requestCode = ticketLease.code;
     const requestLoginData = ticketLease.ticket;
     if (requestCode !== 200 || !requestLoginData) {
@@ -838,8 +844,10 @@ export class NeteaseRealtimeTransport {
       this.activeMemberProfile = options.memberProfile ?? null;
       this.status.connected = true;
       this.status.lastError = null;
+      this.activeTicketLease = ticketLease;
+      keepTicketLease = true;
     } finally {
-      await ticketLease.release();
+      if (!keepTicketLease) await ticketLease.release();
       if (timeoutHandle) clearTimeout(timeoutHandle);
       if (this.pendingEnter?.generation === generation) this.pendingEnter = null;
     }
@@ -902,6 +910,10 @@ export class NeteaseRealtimeTransport {
     this.status.chatRoomId = null;
     this.status.credentialsReady = false;
     this.activeMemberProfile = null;
+
+    const ticketLease = this.activeTicketLease;
+    this.activeTicketLease = null;
+    await ticketLease?.release();
 
     if (roomNumber !== null && this.chatroom) {
       try {
